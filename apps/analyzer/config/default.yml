@@ -1,0 +1,68 @@
+sampling:
+  fps: 3.0
+  max_frames: null
+
+fight_detection:
+  motion_threshold: 0.035
+  min_active_seconds: 2.0
+  idle_end_seconds: 5.0
+  min_duration_seconds: 8.0
+  review_after_seconds: 240.0
+  ignore_initial_seconds: 90.0
+
+ocr:
+  enabled: true
+  interval_seconds: 5.0
+  tesseract_cmd: tesseract
+  languages: eng+rus+jpn+chi_sim+chi_tra
+  min_match_id_length: 16
+  min_match_id_votes: 2
+  save_crops: true
+
+debug:
+  save_transition_frames: true
+  save_every_n_sampled_frames: 0
+
+regions:
+  # Normalized coordinates: x, y, width, height in 0..1.
+  # These are intentionally broad placeholders. Tune against real 16:9 captures.
+  center_combat:
+    x: 0.18
+    y: 0.18
+    width: 0.64
+    height: 0.58
+  killfeed:
+    x: 0.66
+    y: 0.08
+    width: 0.32
+    height: 0.28
+  squad_panel:
+    x: 0.02
+    y: 0.18
+    width: 0.22
+    height: 0.34
+  match_id:
+    x: 0.0
+    y: 0.955
+    width: 0.24
+    height: 0.045
+  squad_hud:
+    x: 0.0
+    y: 0.60
+    width: 0.24
+    height: 0.35
+  team_feed:
+    x: 0.0
+    y: 0.36
+    width: 0.38
+    height: 0.28
+  lobby_party:
+    x: 0.70
+    y: 0.10
+    width: 0.29
+    height: 0.25
+  gameplay_markers:
+    x: 0.0
+    y: 0.03
+    width: 0.22
+    height: 0.25

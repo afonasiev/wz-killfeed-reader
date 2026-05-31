@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+data/input/*
+data/output/*
+test_fragments/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+!test_fragments/.gitkeep

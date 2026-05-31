@@ -1,0 +1,10 @@
+services:
+  analyzer:
+    build:
+      context: ./apps/analyzer
+    volumes:
+      - ./data:/data
+      - ./test_fragments:/data/test_fragments:ro
+      - ./apps/analyzer/config:/app/config:ro
+    environment:
+      WARZONE_ANALYZER_CONFIG: /app/config/default.yml
