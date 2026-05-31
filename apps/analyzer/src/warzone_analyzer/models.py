@@ -130,6 +130,7 @@ class AnalyzerSummary:
     warzone_match_id: Optional[str] = None
     warzone_match_ids: list[str] = field(default_factory=list)
     team_members: list[str] = field(default_factory=list)
+    team_colors: list[dict[str, object]] = field(default_factory=list)
     team_history: list[dict[str, object]] = field(default_factory=list)
     state_counts: dict[str, int] = field(default_factory=dict)
 

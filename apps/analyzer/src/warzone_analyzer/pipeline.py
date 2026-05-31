@@ -72,12 +72,15 @@ def analyze_source(
         events.extend(match_id_detector.process(sampled_frame))
         events.extend(team_detector.process(sampled_frame, prefer_lobby=detected_state == MatchState.LOBBY))
 
-        if (
-            sampled_frame.timestamp_ms >= int(config.fight_detection.ignore_initial_seconds * 1000)
-            and detected_state in {MatchState.GAMEPLAY, MatchState.SPECTATING_OR_DEAD}
-        ):
+        can_process_match_events = sampled_frame.timestamp_ms >= int(config.fight_detection.ignore_initial_seconds * 1000)
+        if can_process_match_events and detected_state in {MatchState.GAMEPLAY, MatchState.SPECTATING_OR_DEAD}:
             events.extend(activity_detector.process(sampled_frame))
-            events.extend(team_feed_detector.process(sampled_frame, team_detector.members))
+            events.extend(team_feed_detector.process(sampled_frame, team_detector.members, team_detector.profiles))
+        elif can_process_match_events and detected_state == MatchState.UNKNOWN:
+            events.extend(team_feed_detector.process(sampled_frame, team_detector.members, team_detector.profiles))
+            close_event = activity_detector.force_close(sampled_frame, reason=f"state_changed_to_{detected_state.value}")
+            if close_event is not None:
+                events.append(close_event)
         else:
             close_event = activity_detector.force_close(sampled_frame, reason=f"state_changed_to_{detected_state.value}")
             if close_event is not None:
@@ -119,6 +122,7 @@ def analyze_source(
         warzone_match_id=match_id_detector.best_match_id,
         warzone_match_ids=match_id_detector.match_ids,
         team_members=team_detector.members,
+        team_colors=team_detector.profiles,
         team_history=team_detector.history,
         state_counts=state_counts,
     )

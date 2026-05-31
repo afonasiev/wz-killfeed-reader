@@ -53,9 +53,9 @@ regions:
     height: 0.35
   team_feed:
     x: 0.0
-    y: 0.36
-    width: 0.38
-    height: 0.28
+    y: 0.30
+    width: 0.50
+    height: 0.36
   lobby_party:
     x: 0.70
     y: 0.10

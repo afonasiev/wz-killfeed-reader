@@ -41,7 +41,7 @@ class TesseractOcr:
                 "-l",
                 self._config.ocr.languages,
                 "--psm",
-                "7" if mode == "match_id" else "6",
+                _psm_for_mode(mode),
             ]
             if mode == "match_id":
                 command.extend(["-c", "tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"])
@@ -90,12 +90,36 @@ def normalize_ocr_lines(text: str) -> str:
     return "\n".join(lines)
 
 
+def _psm_for_mode(mode: str) -> str:
+    if mode in {"match_id", "feed_line", "feed_name"}:
+        return "7"
+    if mode == "feed_raw":
+        return "8"
+    if mode == "feed_sparse":
+        return "11"
+    return "6"
+
+
 def _prepare_for_ocr(image: np.ndarray, mode: str) -> np.ndarray:
-    scale = 4 if mode == "match_id" else 3
+    scale = 6 if mode in {"feed_line", "feed_name", "feed_raw"} else 4 if mode == "match_id" else 3
     resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if mode == "feed_raw":
+        return resized
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     if mode == "match_id":
         gray = cv2.convertScaleAbs(gray, alpha=2.4, beta=10)
         return cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)[1]
+    if mode in {"feed_line", "feed_name", "feed_sparse"}:
+        hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        colored_text = (saturation > 45) & (value > 70)
+        white_text = (saturation < 80) & (value > 170)
+        mask = (colored_text | white_text).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        prepared = np.full(mask.shape, 255, dtype=np.uint8)
+        prepared[mask > 0] = 0
+        return cv2.medianBlur(prepared, 3)
     gray = cv2.convertScaleAbs(gray, alpha=1.8, beta=8)
     return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
