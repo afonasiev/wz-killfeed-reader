@@ -13,6 +13,10 @@ fight_detection:
 ocr:
   enabled: true
   interval_seconds: 5.0
+  async_enabled: true
+  worker_threads: 1
+  max_pending_tasks: 32
+  cache_mse_threshold: 0.0025
   tesseract_cmd: tesseract
   languages: eng+rus+jpn+chi_sim+chi_tra
   min_match_id_length: 16

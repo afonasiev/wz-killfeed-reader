@@ -1,0 +1,8 @@
+numpy>=2.0,<3
+opencv-python>=4.10,<5
+PyYAML>=6.0,<7
+pytest>=8.0,<9
+
+# Runtime also requires the tesseract binary and language packs installed on the host.
+# Dockerfile installs: tesseract-ocr, tesseract-ocr-eng, tesseract-ocr-rus,
+# tesseract-ocr-jpn, tesseract-ocr-chi-sim, tesseract-ocr-chi-tra.

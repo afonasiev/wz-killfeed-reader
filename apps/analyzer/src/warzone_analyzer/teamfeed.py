@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from .models import AnalyzerConfig, AnalyzerEvent, EventType
-from .ocr import TesseractOcr, normalize_ocr_lines
+from .ocr import OcrReader, normalize_ocr_lines
 from .output import AnalyzerOutput
 from .regions import crop_region
 from .video import SampledFrame
@@ -53,7 +53,7 @@ class PendingFeedEvent:
 
 
 class TeamFeedDetector:
-    def __init__(self, config: AnalyzerConfig, ocr: TesseractOcr, output: AnalyzerOutput) -> None:
+    def __init__(self, config: AnalyzerConfig, ocr: OcrReader, output: AnalyzerOutput) -> None:
         self._config = config
         self._ocr = ocr
         self._output = output
@@ -70,8 +70,6 @@ class TeamFeedDetector:
         region = self._config.regions.get("team_feed")
         if region is None or not self._should_run(sampled_frame.timestamp_ms):
             return []
-        if not team_members:
-            return []
 
         crop = crop_region(sampled_frame.image, region)
         crop_path = None
@@ -80,21 +78,19 @@ class TeamFeedDetector:
 
         parsed_lines = self._parse_visual_rows(crop, sampled_frame, team_members, team_profiles or [])
         if not parsed_lines:
-            result = self._ocr.read_text(crop, mode="feed_sparse")
+            result = self._ocr.read_text(crop, mode="feed_sparse", cache_key="team_feed:block")
             parsed_lines = parse_team_feed_text(result.normalized, team_members)
 
         events = []
         for parsed in parsed_lines:
-            if team_members and parsed.relation == "unknown":
-                continue
             stable = self._add_observation(parsed, sampled_frame)
             if stable is None:
                 continue
             actor_name = stable.actor.nickname if stable.actor else None
             target_name = stable.target.nickname if stable.target else None
-            if target_name is None and stable.event_type in {EventType.KILL, EventType.KNOCK}:
-                continue
-            key = (stable.event_type.value, actor_name, target_name, sampled_frame.timestamp_ms // 3000)
+            row_bucket = int(float(stable.evidence.get("row_y", 0)) // 24)
+            dedupe_target = target_name or f"row:{row_bucket}"
+            key = (stable.event_type.value, actor_name, dedupe_target, sampled_frame.timestamp_ms // 3000)
             if key in self._seen:
                 continue
             self._seen.add(key)
@@ -162,10 +158,11 @@ class TeamFeedDetector:
                     sampled_frame,
                 )
 
-            full = self._ocr.read_text(row.image, mode="feed_line").normalized
+            row_key = f"team_feed:row:{index}"
+            full = self._ocr.read_text(row.image, mode="feed_line", cache_key=f"{row_key}:full").normalized
             left_img, right_img = _split_row_image(row)
-            left_text = self._read_feed_name(left_img) if left_img.size else ""
-            right_text = self._read_feed_name(right_img) if right_img.size else ""
+            left_text = self._read_feed_name(left_img, f"{row_key}:left") if left_img.size else ""
+            right_text = self._read_feed_name(right_img, f"{row_key}:right") if right_img.size else ""
             parsed_line = parse_visual_feed_line(
                 full_text=full,
                 left_text=left_text,
@@ -173,6 +170,7 @@ class TeamFeedDetector:
                 team_members=team_members,
                 team_profiles=team_profiles,
                 actor_color_hex=_dominant_hex_color(left_img),
+                visual_event_type=_visual_event_type(row.image),
                 row_confidence=row.confidence,
                 row_y=row.y1,
                 row_crop_path=row_crop_path,
@@ -181,10 +179,10 @@ class TeamFeedDetector:
                 parsed.append(parsed_line)
         return parsed
 
-    def _read_feed_name(self, image: np.ndarray) -> str:
+    def _read_feed_name(self, image: np.ndarray, cache_key: str) -> str:
         return _join_ocr_texts(
-            self._ocr.read_text(image, mode="feed_name").normalized,
-            self._ocr.read_text(image, mode="feed_raw").normalized,
+            self._ocr.read_text(image, mode="feed_name", cache_key=f"{cache_key}:name").normalized,
+            self._ocr.read_text(image, mode="feed_raw", cache_key=f"{cache_key}:raw").normalized,
         )
 
     def _should_run(self, timestamp_ms: int) -> bool:
@@ -205,6 +203,7 @@ def parse_visual_feed_line(
     team_members: list[str],
     team_profiles: list[dict[str, object]] | None,
     actor_color_hex: str | None,
+    visual_event_type: EventType | None,
     row_confidence: float,
     row_y: int | None,
     row_crop_path: str | None,
@@ -218,17 +217,18 @@ def parse_visual_feed_line(
         actor = actor_from_color
     target = _parse_feed_name(right)
 
-    if actor is None and target is None:
+    if actor is None and target is None and visual_event_type is None:
         return None
     if actor is None and full:
         actor = _parse_feed_name(full)
-    if actor is None:
+    if actor is None and visual_event_type is None:
         return None
 
     explicit_event_type = _event_type_from_line(full)
-    if target is None and explicit_event_type is None:
-        return None
-    event_type = explicit_event_type or EventType.KILL
+    if target is None and explicit_event_type is None and visual_event_type is None:
+        event_type = EventType.TEAM_FEED_EVENT
+    else:
+        event_type = explicit_event_type or visual_event_type or EventType.KILL
     relation = _relation_for(actor.nickname if actor else None, target.nickname if target else None, team_members)
     confidence = min(max(row_confidence, 0.35) + (0.15 if target else 0.0), 0.82)
     raw_text = " | ".join(part for part in [left, right, full] if part)
@@ -245,6 +245,7 @@ def parse_visual_feed_line(
             "right_text": right,
             "full_text": full,
             "actor_color_hex": actor_color_hex,
+            "visual_event_type": visual_event_type.value if visual_event_type else None,
             "row_y": row_y,
             "row_crop": row_crop_path,
         },
@@ -353,12 +354,89 @@ def _name_candidates(values: list[FeedName | None]) -> list[str]:
 def _extract_feed_rows(crop: np.ndarray) -> list[FeedRow]:
     if crop.size == 0:
         return []
-    mask = _feed_text_mask(crop)
-    search_width = crop.shape[1]
+    search_width = int(crop.shape[1] * 0.65)
+    action_rows = _extract_action_rows(crop, search_width)
+    if action_rows:
+        return action_rows
+    mask = _feed_text_mask(crop[:, :search_width])
     red_rows = _extract_red_anchored_rows(crop, mask, search_width)
     if red_rows:
         return red_rows
     return []
+
+
+def _extract_action_rows(crop: np.ndarray, search_width: int) -> list[FeedRow]:
+    search = crop[:, :search_width]
+    hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    red = ((hue < 12) | (hue > 168)) & (saturation > 70) & (value > 90)
+    green = (hue > 35) & (hue < 100) & (saturation > 55) & (value > 80)
+    white = (saturation < 75) & (value > 165)
+    raw_mask = ((red | green | white).astype(np.uint8)) * 255
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask, 8)
+    glyph_mask = np.zeros(raw_mask.shape, dtype=np.uint8)
+    for label in range(1, component_count):
+        x, y, width, height, area = stats[label]
+        if area < 3:
+            continue
+        if area > 450 or width > 180 or height > 34:
+            continue
+        glyph_mask[labels == label] = 255
+
+    row_mask = cv2.morphologyEx(
+        glyph_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (14, 3)),
+        iterations=1,
+    )
+    row_mask = cv2.dilate(row_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    rows: list[FeedRow] = []
+    min_row_y = int(crop.shape[0] * 0.28)
+    for y1, y2 in _projection_groups(row_mask, min_pixels=8, max_gap=4):
+        if y1 < min_row_y:
+            continue
+        height = y2 - y1 + 1
+        if height < 7 or height > 42:
+            continue
+        x_projection = (row_mask[y1 : y2 + 1] > 0).sum(axis=0)
+        columns = np.where(x_projection > 0)[0]
+        if len(columns) < 24:
+            continue
+        x1 = max(int(columns[0]) - 8, 0)
+        x2 = min(int(columns[-1]) + 9, search_width)
+        width = x2 - x1
+        if width < 70 or width > int(crop.shape[1] * 0.56):
+            continue
+        row_red = int(red[y1 : y2 + 1, x1:x2].sum())
+        row_green = int(green[y1 : y2 + 1, x1:x2].sum())
+        row_white = int(white[y1 : y2 + 1, x1:x2].sum())
+        if row_red + row_green < 20 or row_white < 4:
+            continue
+        row_image = crop[max(y1 - 4, 0) : min(y2 + 5, crop.shape[0]), x1:x2]
+        split_x = _detect_weapon_split(row_image)
+        confidence = min(0.42 + (row_red + row_green) / max(width * height * 2.5, 1), 0.82)
+        rows.append(FeedRow(image=row_image, y1=y1, y2=y2, split_x=split_x, confidence=confidence))
+    return sorted(rows, key=lambda row: row.y1)[:6]
+
+
+def _projection_groups(mask: np.ndarray, min_pixels: int, max_gap: int) -> list[tuple[int, int]]:
+    projection = (mask > 0).sum(axis=1)
+    active_rows = np.where(projection > min_pixels)[0]
+    if len(active_rows) == 0:
+        return []
+    groups = []
+    start = previous = int(active_rows[0])
+    for row in active_rows[1:]:
+        current = int(row)
+        if current - previous > max_gap:
+            groups.append((start, previous))
+            start = current
+        previous = current
+    groups.append((start, previous))
+    return groups
 
 
 def _extract_red_anchored_rows(crop: np.ndarray, mask: np.ndarray, search_width: int) -> list[FeedRow]:
@@ -384,6 +462,7 @@ def _extract_red_anchored_rows(crop: np.ndarray, mask: np.ndarray, search_width:
             groups.append([component])
 
     rows = []
+    min_row_y = int(crop.shape[0] * 0.28)
     for group in groups:
         red_x1 = min(x for x, _, _, _ in group)
         red_y1 = min(y for _, y, _, _ in group)
@@ -395,6 +474,8 @@ def _extract_red_anchored_rows(crop: np.ndarray, mask: np.ndarray, search_width:
         y1 = max(red_y1 - 16, 0)
         x2 = min(red_x2 + 45, search_width)
         y2 = min(red_y2 + 16, crop.shape[0])
+        if y1 < min_row_y:
+            continue
         if x2 - x1 < 70 or y2 - y1 < 12:
             continue
         row_image = crop[y1:y2, x1:x2]
@@ -458,6 +539,30 @@ def _detect_weapon_split(row: np.ndarray) -> int | None:
     return split if 0 < split < width else None
 
 
+def _visual_event_type(row: np.ndarray) -> EventType | None:
+    if row.size == 0:
+        return None
+    hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    red_pixels = int(((((hue < 12) | (hue > 168)) & (saturation > 70) & (value > 90))).sum())
+    green_pixels = int((((hue > 35) & (hue < 100) & (saturation > 55) & (value > 80))).sum())
+    white = ((saturation < 75) & (value > 165)).astype(np.uint8)
+    if red_pixels + green_pixels < 20:
+        return None
+    columns = np.where(white.sum(axis=0) > 0)[0]
+    if len(columns) == 0:
+        return None
+    white_width = int(columns[-1] - columns[0] + 1)
+    white_pixels = int(white.sum())
+    if white_width >= 24 and white_pixels >= 18:
+        return EventType.KILL
+    if white_width >= 8 and white_pixels >= 8:
+        return EventType.TEAM_FEED_EVENT
+    return None
+
+
 def _split_row_image(row: FeedRow) -> tuple[np.ndarray, np.ndarray]:
     image = row.image
     if image.size == 0:
@@ -496,6 +601,8 @@ def _event_type_from_line(line: str) -> EventType | None:
         return EventType.KILL
     if any(token in lowered for token in ["умер", "dead", "killed by", "убит"]):
         return EventType.DEATH
+    if any(token in lowered for token in ["отмет", "метк", "ping", "mark"]):
+        return EventType.TEAM_FEED_EVENT
     return None
 
 

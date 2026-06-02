@@ -9,14 +9,14 @@ import cv2
 import numpy as np
 
 from .models import AnalyzerConfig, AnalyzerEvent, EventType
-from .ocr import StableTextVote, TesseractOcr
+from .ocr import OcrReader, StableTextVote
 from .output import AnalyzerOutput
 from .regions import crop_region
 from .video import SampledFrame
 
 
 class MatchIdDetector:
-    def __init__(self, config: AnalyzerConfig, ocr: TesseractOcr, output: AnalyzerOutput) -> None:
+    def __init__(self, config: AnalyzerConfig, ocr: OcrReader, output: AnalyzerOutput) -> None:
         self._config = config
         self._ocr = ocr
         self._output = output
@@ -42,7 +42,7 @@ class MatchIdDetector:
         if self._config.ocr.save_crops:
             crop_path = self._output.save_debug_crop(crop, "match_id", "match_id", sampled_frame)
 
-        result = self._ocr.read_text(crop, mode="match_id")
+        result = self._ocr.read_text(crop, mode="match_id", cache_key="match_id")
         if len(result.normalized) < self._config.ocr.min_match_id_length:
             return []
         if not result.normalized.isdigit():
@@ -104,7 +104,7 @@ class TeamMemberProfile:
 
 
 class TeamDetector:
-    def __init__(self, config: AnalyzerConfig, ocr: TesseractOcr, output: AnalyzerOutput) -> None:
+    def __init__(self, config: AnalyzerConfig, ocr: OcrReader, output: AnalyzerOutput) -> None:
         self._config = config
         self._ocr = ocr
         self._output = output
@@ -144,7 +144,7 @@ class TeamDetector:
         row_detections = [] if prefer_lobby else self._extract_hud_rows(crop, sampled_frame)
         row_names = [detection["name"] for detection in row_detections]
 
-        result = self._ocr.read_text(crop, mode="text")
+        result = self._ocr.read_text(crop, mode="text", cache_key=f"team:{region_name}:block")
         block_detected = self._extract_members(result.normalized, prefer_lobby=prefer_lobby)
         detected = _dedupe([*row_names, *block_detected])
         for member in detected:
@@ -223,7 +223,7 @@ class TeamDetector:
                     f"squad_hud_row_{index}",
                     sampled_frame,
                 )
-            text = self._ocr.read_text(row["image"], mode="text").normalized
+            text = self._ocr.read_text(row["image"], mode="text", cache_key=f"squad_hud:row:{index}").normalized
             names = _parse_hud_names(text)
             if not names:
                 continue

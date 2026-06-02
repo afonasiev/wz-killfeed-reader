@@ -57,5 +57,8 @@ Edit `config/default.yml`:
 - `fight_detection.idle_end_seconds` controls when a fight is considered over;
 - `regions.*` contains normalized screen regions for 16:9 captures.
 - `ocr.min_match_id_votes` controls how many repeated OCR reads are required before a match ID is accepted.
+- `ocr.async_enabled` moves expensive OCR calls off the frame loop and returns cached stable ROI results while new text is processed.
+- `ocr.cache_mse_threshold` controls how much a cropped text region may change before OCR is scheduled again.
+- `ocr.worker_threads` and `ocr.max_pending_tasks` bound OCR CPU use and queue growth for stream processing.
 
 For long recordings, use `--start-at` and `--duration` while tuning. The analyzer writes both low-level `events.jsonl` and aggregated `fights.json`, because one source video can contain many separate fights.

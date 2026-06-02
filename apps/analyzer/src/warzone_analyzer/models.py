@@ -59,6 +59,10 @@ class FightDetectionConfig:
 class OcrConfig:
     enabled: bool = True
     interval_seconds: float = 5.0
+    async_enabled: bool = True
+    worker_threads: int = 1
+    max_pending_tasks: int = 32
+    cache_mse_threshold: float = 0.0025
     tesseract_cmd: str = "tesseract"
     languages: str = "eng+rus+jpn"
     min_match_id_length: int = 16

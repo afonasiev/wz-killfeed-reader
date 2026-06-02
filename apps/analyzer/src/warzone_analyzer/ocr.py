@@ -5,7 +5,10 @@ import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
+from typing import Protocol
 
 import cv2
 import numpy as np
@@ -20,11 +23,24 @@ class OcrResult:
     confidence: float
 
 
+class OcrReader(Protocol):
+    def read_text(self, image: np.ndarray, mode: str = "text", cache_key: str | None = None) -> OcrResult:
+        ...
+
+
+@dataclass
+class _CachedOcrState:
+    fingerprint: np.ndarray | None = None
+    result: OcrResult | None = None
+    pending: Future[OcrResult] | None = None
+    pending_fingerprint: np.ndarray | None = None
+
+
 class TesseractOcr:
     def __init__(self, config: AnalyzerConfig) -> None:
         self._config = config
 
-    def read_text(self, image: np.ndarray, mode: str = "text") -> OcrResult:
+    def read_text(self, image: np.ndarray, mode: str = "text", cache_key: str | None = None) -> OcrResult:
         if not self._config.ocr.enabled:
             return OcrResult(text="", normalized="", confidence=0.0)
 
@@ -55,6 +71,62 @@ class TesseractOcr:
             return OcrResult(text="", normalized="", confidence=0.0)
         finally:
             temp_path.unlink(missing_ok=True)
+
+
+class AsyncCachedOcr:
+    def __init__(self, engine: OcrReader, config: AnalyzerConfig) -> None:
+        self._engine = engine
+        self._config = config
+        self._executor = ThreadPoolExecutor(max_workers=max(config.ocr.worker_threads, 1))
+        self._states: dict[str, _CachedOcrState] = {}
+        self._lock = Lock()
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=False)
+
+    def read_text(self, image: np.ndarray, mode: str = "text", cache_key: str | None = None) -> OcrResult:
+        if not self._config.ocr.enabled:
+            return OcrResult(text="", normalized="", confidence=0.0)
+        if image.size == 0:
+            return OcrResult(text="", normalized="", confidence=0.0)
+
+        key = cache_key or mode
+        fingerprint = _ocr_fingerprint(image)
+
+        with self._lock:
+            state = self._states.setdefault(key, _CachedOcrState())
+            self._collect_completed(state)
+
+            if state.result is not None and state.fingerprint is not None:
+                if _fingerprint_mse(state.fingerprint, fingerprint) <= self._config.ocr.cache_mse_threshold:
+                    return state.result
+
+            if state.pending is not None:
+                return state.result or OcrResult(text="", normalized="", confidence=0.0)
+
+            if self._pending_count() >= self._config.ocr.max_pending_tasks:
+                return state.result or OcrResult(text="", normalized="", confidence=0.0)
+
+            state.pending_fingerprint = fingerprint
+            state.pending = self._executor.submit(self._engine.read_text, image.copy(), mode, None)
+            return state.result or OcrResult(text="", normalized="", confidence=0.0)
+
+    @staticmethod
+    def _collect_completed(state: _CachedOcrState) -> None:
+        if state.pending is None or not state.pending.done():
+            return
+        try:
+            state.result = state.pending.result()
+            state.fingerprint = state.pending_fingerprint
+        except Exception:
+            state.result = OcrResult(text="", normalized="", confidence=0.0)
+            state.fingerprint = state.pending_fingerprint
+        finally:
+            state.pending = None
+            state.pending_fingerprint = None
+
+    def _pending_count(self) -> int:
+        return sum(1 for state in self._states.values() if state.pending is not None)
 
 
 class StableTextVote:
@@ -123,3 +195,16 @@ def _prepare_for_ocr(image: np.ndarray, mode: str) -> np.ndarray:
         return cv2.medianBlur(prepared, 3)
     gray = cv2.convertScaleAbs(gray, alpha=1.8, beta=8)
     return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+
+def _ocr_fingerprint(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32) / 255.0
+
+
+def _fingerprint_mse(previous: np.ndarray, current: np.ndarray) -> float:
+    if previous.shape != current.shape:
+        return 1.0
+    delta = previous - current
+    return float(np.mean(delta * delta))
