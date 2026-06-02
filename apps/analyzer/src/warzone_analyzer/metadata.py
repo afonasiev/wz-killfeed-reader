@@ -21,6 +21,7 @@ class MatchIdDetector:
         self._ocr = ocr
         self._output = output
         self._vote = StableTextVote()
+        self._observations: list[str] = []
         self._last_ocr_ms: int | None = None
         self._last_emitted: str | None = None
 
@@ -48,8 +49,11 @@ class MatchIdDetector:
         if not result.normalized.isdigit():
             return []
 
-        self._vote.add(result.normalized)
         current = result.normalized
+        self._observations.append(current)
+        self._observations = self._observations[-12:]
+        current = _stable_match_id(current, self._observations) or current
+        self._vote.add(current)
         if self._vote.count(current) < self._config.ocr.min_match_id_votes:
             return []
         if current == self._last_emitted:
@@ -81,6 +85,27 @@ class MatchIdDetector:
             self._last_ocr_ms = timestamp_ms
             return True
         return False
+
+
+def _stable_match_id(current: str, observations: list[str]) -> str | None:
+    cluster = [
+        observation
+        for observation in observations
+        if len(observation) == len(current) and _hamming_distance(observation, current) <= 2
+    ]
+    if len(cluster) < 2:
+        return None
+    chars = []
+    for index in range(len(current)):
+        counter = Counter(observation[index] for observation in cluster)
+        chars.append(counter.most_common(1)[0][0])
+    return "".join(chars)
+
+
+def _hamming_distance(left: str, right: str) -> int:
+    if len(left) != len(right):
+        return max(len(left), len(right))
+    return sum(1 for left_char, right_char in zip(left, right) if left_char != right_char)
 
 
 @dataclass

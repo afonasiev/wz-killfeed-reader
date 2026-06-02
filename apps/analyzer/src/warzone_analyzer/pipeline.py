@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 
 from .detectors import FightActivityDetector
 from .metadata import MatchIdDetector, TeamDetector
-from .models import AnalyzerConfig, AnalyzerEvent, AnalyzerSummary, EventType, FightSegment, MatchState
+from .models import AnalyzerConfig, AnalyzerEvent, AnalyzerSummary, EventType, FightSegment, MatchState, fight_uid
 from .ocr import AsyncCachedOcr, OcrReader, TesseractOcr
 from .output import AnalyzerOutput
 from .state import MatchStateDetector
@@ -30,8 +31,10 @@ def analyze_source(
     team_feed_detector = TeamFeedDetector(config, ocr, output)
     sampled_frames = 0
     event_count = 0
+    all_events: list[AnalyzerEvent] = []
     fights: list[FightSegment] = []
     open_fight: FightSegment | None = None
+    pending_action_events: list[AnalyzerEvent] = []
     current_state = MatchState.UNKNOWN
     state_counts: dict[str, int] = {}
 
@@ -51,7 +54,7 @@ def analyze_source(
             if detected_state != current_state:
                 current_state = detected_state
                 state_crop = None
-                region = config.regions.get("gameplay_markers")
+                region = config.regions.get("center_combat")
                 if region is not None and config.ocr.save_crops:
                     from .regions import crop_region
 
@@ -106,18 +109,24 @@ def analyze_source(
                     config=config,
                     warzone_match_id=match_id_detector.best_match_id,
                     state=detected_state,
+                    pending_action_events=pending_action_events,
                 )
-                output.write_event(event)
+                all_events.append(event)
                 event_count += 1
     finally:
         if async_ocr is not None:
             async_ocr.close()
 
     if open_fight is not None:
+        _attach_pending_actions(open_fight, pending_action_events, config.fight_detection.action_attach_tolerance_ms)
+    if open_fight is not None:
         if _finalize_fight(open_fight, config):
             fights.append(open_fight)
 
+    for event in all_events:
+        output.write_event(event)
     output.write_fights(fights)
+    action_counts, team_action_summary = _summarize_actions(fights)
     summary = AnalyzerSummary(
         input=source,
         output_dir=output_dir,
@@ -131,6 +140,9 @@ def analyze_source(
         team_colors=team_detector.profiles,
         team_history=team_detector.history,
         state_counts=state_counts,
+        actions=sum(action_counts.values()),
+        action_counts=dict(action_counts),
+        team_action_summary=team_action_summary,
     )
     output.write_summary(summary)
     return summary
@@ -143,13 +155,14 @@ def _update_fights(
     config: AnalyzerConfig,
     warzone_match_id: str | None,
     state: MatchState,
+    pending_action_events: list[AnalyzerEvent],
 ) -> FightSegment | None:
     if event.type == EventType.FIGHT_STARTED:
         if open_fight is not None:
             if _finalize_fight(open_fight, config):
                 fights.append(open_fight)
 
-        return FightSegment(
+        fight = FightSegment(
             fight_id=len(fights) + 1,
             started_at_ms=event.timestamp_ms,
             start_frame_index=event.frame_index,
@@ -158,10 +171,13 @@ def _update_fights(
             evidence={"start": event.details},
             start_debug_frame=event.debug_frame,
         )
+        _attach_pending_actions(fight, pending_action_events, config.fight_detection.action_attach_tolerance_ms)
+        return fight
 
     if event.type == EventType.FIGHT_ENDED and open_fight is not None:
         if warzone_match_id and open_fight.warzone_match_id is None:
             open_fight.warzone_match_id = warzone_match_id
+            _sync_fight_action_identity(open_fight)
         open_fight.ended_at_ms = event.timestamp_ms
         open_fight.end_frame_index = event.frame_index
         open_fight.duration_ms = event.timestamp_ms - open_fight.started_at_ms
@@ -173,6 +189,16 @@ def _update_fights(
 
     if event.type == EventType.MATCH_ID_DETECTED and open_fight is not None:
         open_fight.warzone_match_id = str(event.details.get("warzone_match_id") or open_fight.warzone_match_id)
+        _sync_fight_action_identity(open_fight)
+
+    if _is_action_event(event):
+        if open_fight is not None:
+            _append_action(open_fight, event)
+        elif _append_to_recent_fight(fights, event, config.fight_detection.action_attach_tolerance_ms):
+            return open_fight
+        else:
+            pending_action_events.append(event)
+            _trim_pending_actions(pending_action_events, event.timestamp_ms, config.fight_detection.action_attach_tolerance_ms)
 
     return open_fight
 
@@ -190,3 +216,115 @@ def _finalize_fight(fight: FightSegment, config: AnalyzerConfig) -> bool:
         fight.needs_review = True
         fight.evidence["review_reason"] = "too_long_without_killfeed_confirmation"
     return True
+
+
+def _is_action_event(event: AnalyzerEvent) -> bool:
+    return event.type in {EventType.KILL, EventType.KNOCK, EventType.DEATH, EventType.TEAM_FEED_EVENT}
+
+
+def _attach_pending_actions(fight: FightSegment, pending_action_events: list[AnalyzerEvent], tolerance_ms: int) -> None:
+    remaining = []
+    for action_event in pending_action_events:
+        if fight.started_at_ms - tolerance_ms <= action_event.timestamp_ms <= fight.started_at_ms + tolerance_ms:
+            _append_action(fight, action_event)
+        else:
+            remaining.append(action_event)
+    pending_action_events[:] = remaining
+
+
+def _append_to_recent_fight(fights: list[FightSegment], event: AnalyzerEvent, tolerance_ms: int) -> bool:
+    if not fights:
+        return False
+    fight = fights[-1]
+    ended_at_ms = fight.ended_at_ms
+    if ended_at_ms is None or event.timestamp_ms > ended_at_ms + tolerance_ms:
+        return False
+    if event.timestamp_ms < fight.started_at_ms - tolerance_ms:
+        return False
+    _append_action(fight, event)
+    return True
+
+
+def _append_action(fight: FightSegment, event: AnalyzerEvent) -> None:
+    uid = fight_uid(fight.warzone_match_id, fight.fight_id)
+    event.details["fight_id"] = fight.fight_id
+    event.details["fight_uid"] = uid
+    event.details["warzone_match_id"] = fight.warzone_match_id
+    action = _event_to_action(fight, event)
+    dedupe_key = (
+        action["type"],
+        action.get("team_member"),
+        action.get("target_enemy"),
+        int(event.timestamp_ms) // 3000,
+    )
+    for existing in fight.actions:
+        existing_key = (
+            existing["type"],
+            existing.get("team_member"),
+            existing.get("target_enemy"),
+            int(existing["timestamp_ms"]) // 3000,
+        )
+        if existing_key == dedupe_key:
+            return
+    action["action_id"] = f"{uid}:action:{len(fight.actions) + 1}"
+    fight.actions.append(action)
+
+
+def _event_to_action(fight: FightSegment, event: AnalyzerEvent) -> dict[str, object]:
+    details = event.details
+    evidence = details.get("evidence") if isinstance(details.get("evidence"), dict) else {}
+    team_member = details.get("actor")
+    target_enemy = details.get("target")
+    if details.get("relation") == "team_received":
+        team_member = details.get("target")
+        target_enemy = details.get("actor")
+
+    return {
+        "action_id": "",
+        "fight_uid": fight_uid(fight.warzone_match_id, fight.fight_id),
+        "fight_id": fight.fight_id,
+        "warzone_match_id": fight.warzone_match_id,
+        "timestamp_ms": event.timestamp_ms,
+        "frame_index": event.frame_index,
+        "type": event.type.value,
+        "action_kind": details.get("action_kind") or evidence.get("action_kind"),
+        "team_member": team_member,
+        "team_member_color_hex": details.get("actor_color_hex") or evidence.get("actor_color_hex"),
+        "team_member_profile_candidate": evidence.get("team_member_profile_candidate"),
+        "target_enemy": target_enemy,
+        "enemy_name_color": "red" if target_enemy else None,
+        "relation": details.get("relation"),
+        "confidence": event.confidence,
+        "raw_text": details.get("raw_text"),
+        "evidence": evidence,
+        "debug_frame": event.debug_frame,
+        "crop": details.get("crop") or evidence.get("row_crop"),
+        "needs_review": bool(evidence.get("needs_review") or not team_member or (event.type in {EventType.KILL, EventType.KNOCK} and not target_enemy)),
+    }
+
+
+def _trim_pending_actions(pending_action_events: list[AnalyzerEvent], timestamp_ms: int, tolerance_ms: int) -> None:
+    pending_action_events[:] = [
+        event for event in pending_action_events if timestamp_ms - event.timestamp_ms <= tolerance_ms
+    ]
+
+
+def _sync_fight_action_identity(fight: FightSegment) -> None:
+    uid = fight_uid(fight.warzone_match_id, fight.fight_id)
+    for index, action in enumerate(fight.actions, start=1):
+        action["fight_uid"] = uid
+        action["warzone_match_id"] = fight.warzone_match_id
+        action["action_id"] = f"{uid}:action:{index}"
+
+
+def _summarize_actions(fights: list[FightSegment]) -> tuple[Counter[str], dict[str, dict[str, int]]]:
+    action_counts: Counter[str] = Counter()
+    team_summary: dict[str, Counter[str]] = {}
+    for fight in fights:
+        for action in fight.actions:
+            action_type = str(action.get("type") or "unknown")
+            action_counts[action_type] += 1
+            member = str(action.get("team_member") or "unknown_team_member")
+            team_summary.setdefault(member, Counter())[action_type] += 1
+            team_summary[member]["total"] += 1
+    return action_counts, {member: dict(counts) for member, counts in team_summary.items()}

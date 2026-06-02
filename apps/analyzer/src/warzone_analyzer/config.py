@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import AnalyzerConfig, DebugConfig, FightDetectionConfig, OcrConfig, Region, SamplingConfig
+from .models import AnalyzerConfig, DebugConfig, FightDetectionConfig, OcrConfig, Region, SamplingConfig, TeamFeedConfig
 
 
 def load_config(config_path: Path | None) -> AnalyzerConfig:
@@ -20,6 +20,7 @@ def load_config(config_path: Path | None) -> AnalyzerConfig:
         sampling=SamplingConfig(**(raw_config.get("sampling") or {})),
         fight_detection=FightDetectionConfig(**(raw_config.get("fight_detection") or {})),
         ocr=OcrConfig(**(raw_config.get("ocr") or {})),
+        team_feed=TeamFeedConfig(**(raw_config.get("team_feed") or {})),
         debug=DebugConfig(**(raw_config.get("debug") or {})),
         regions={
             name: Region(**region_config)

@@ -44,7 +44,10 @@ class TesseractOcr:
         if not self._config.ocr.enabled:
             return OcrResult(text="", normalized="", confidence=0.0)
 
-        prepared = _prepare_for_ocr(image, mode)
+        results = [self._read_prepared(prepared, mode) for prepared in _prepare_variants_for_ocr(image, mode)]
+        return _best_ocr_result(results, mode)
+
+    def _read_prepared(self, prepared: np.ndarray, mode: str) -> OcrResult:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
             temp_path = Path(temp_file.name)
 
@@ -92,6 +95,15 @@ class AsyncCachedOcr:
 
         key = cache_key or mode
         fingerprint = _ocr_fingerprint(image)
+        if mode in {"match_id", "feed_name", "feed_enemy_name"}:
+            result = self._engine.read_text(image.copy(), mode, None)
+            with self._lock:
+                state = self._states.setdefault(key, _CachedOcrState())
+                state.result = result
+                state.fingerprint = fingerprint
+                state.pending = None
+                state.pending_fingerprint = None
+            return result
 
         with self._lock:
             state = self._states.setdefault(key, _CachedOcrState())
@@ -162,8 +174,25 @@ def normalize_ocr_lines(text: str) -> str:
     return "\n".join(lines)
 
 
+def _best_ocr_result(results: list[OcrResult], mode: str) -> OcrResult:
+    if not results:
+        return OcrResult(text="", normalized="", confidence=0.0)
+    if mode == "match_id":
+        return max(results, key=lambda result: (len(result.normalized), result.normalized.isdigit(), result.confidence))
+    return max(results, key=lambda result: (_text_information_score(result.normalized), result.confidence))
+
+
+def _text_information_score(text: str) -> float:
+    cleaned = normalize_ocr_lines(text)
+    if not cleaned:
+        return 0.0
+    useful = len(re.findall(r"[A-Za-z0-9А-Яа-я\u3040-\u30ff\u3400-\u9fff]", cleaned))
+    noise = len(re.findall(r"[^A-Za-z0-9А-Яа-я\u3040-\u30ff\u3400-\u9fff _\\-\\[\\]]", cleaned))
+    return useful - noise * 1.5
+
+
 def _psm_for_mode(mode: str) -> str:
-    if mode in {"match_id", "feed_line", "feed_name"}:
+    if mode in {"match_id", "feed_line", "feed_name", "feed_enemy_name"}:
         return "7"
     if mode == "feed_raw":
         return "8"
@@ -173,28 +202,83 @@ def _psm_for_mode(mode: str) -> str:
 
 
 def _prepare_for_ocr(image: np.ndarray, mode: str) -> np.ndarray:
-    scale = 6 if mode in {"feed_line", "feed_name", "feed_raw"} else 4 if mode == "match_id" else 3
-    resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return _prepare_variants_for_ocr(image, mode)[0]
+
+
+def _prepare_variants_for_ocr(image: np.ndarray, mode: str) -> list[np.ndarray]:
+    if image.size == 0:
+        return [image]
+    scale = 6 if mode in {"feed_line", "feed_name", "feed_enemy_name", "feed_raw"} else 4 if mode == "match_id" else 3
+    resized = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
     if mode == "feed_raw":
-        return resized
+        return [resized]
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     if mode == "match_id":
-        gray = cv2.convertScaleAbs(gray, alpha=2.4, beta=10)
-        return cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)[1]
-    if mode in {"feed_line", "feed_name", "feed_sparse"}:
+        contrast = cv2.convertScaleAbs(gray, alpha=1.8, beta=-20)
+        binary = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        inverse = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        adaptive = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            41,
+            3,
+        )
+        return [image, resized, gray, contrast, binary, inverse, adaptive]
+    if mode in {"feed_line", "feed_name", "feed_enemy_name", "feed_sparse"}:
+        denoised = cv2.bilateralFilter(resized, 5, 45, 45)
+        gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
         hsv = cv2.cvtColor(resized, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
+        red_text = ((hue < 35) | (hue > 168)) & (saturation > 30) & (value > 45)
         colored_text = (saturation > 45) & (value > 70)
         white_text = (saturation < 80) & (value > 170)
-        mask = (colored_text | white_text).astype(np.uint8) * 255
+        if mode == "feed_enemy_name":
+            mask = red_text.astype(np.uint8) * 255
+        else:
+            mask = (colored_text | white_text).astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        adaptive = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            7,
+        )
+        mask = cv2.bitwise_or(mask, adaptive if mode != "feed_enemy_name" else cv2.bitwise_and(adaptive, mask))
         prepared = np.full(mask.shape, 255, dtype=np.uint8)
         prepared[mask > 0] = 0
-        return cv2.medianBlur(prepared, 3)
+        masked = cv2.medianBlur(prepared, 3)
+        contrast = cv2.convertScaleAbs(gray, alpha=2.0, beta=-25)
+        binary = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        inverse = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        if mode == "feed_enemy_name":
+            red_only = np.full(mask.shape, 255, dtype=np.uint8)
+            red_only[red_text] = 0
+            return [_trim_ocr_canvas(red_only), gray, contrast]
+        return [masked, gray, contrast]
     gray = cv2.convertScaleAbs(gray, alpha=1.8, beta=8)
-    return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return [cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]]
+
+
+def _trim_ocr_canvas(image: np.ndarray) -> np.ndarray:
+    if image.size == 0:
+        return image
+    foreground = image < 250
+    ys, xs = np.where(foreground)
+    if len(xs) == 0 or len(ys) == 0:
+        return image
+    margin = 12
+    x1 = max(int(xs.min()) - margin, 0)
+    x2 = min(int(xs.max()) + margin + 1, image.shape[1])
+    y1 = max(int(ys.min()) - margin, 0)
+    y2 = min(int(ys.max()) + margin + 1, image.shape[0])
+    return image[y1:y2, x1:x2]
 
 
 def _ocr_fingerprint(image: np.ndarray) -> np.ndarray:

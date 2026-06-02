@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
@@ -60,6 +61,7 @@ class TeamFeedDetector:
         self._last_ocr_ms: int | None = None
         self._seen: set[tuple[str, str | None, str | None, int]] = set()
         self._pending: dict[tuple[str, str | None, int, str], PendingFeedEvent] = {}
+        self._row_buffers: dict[int, deque[np.ndarray]] = {}
 
     def process(
         self,
@@ -83,8 +85,12 @@ class TeamFeedDetector:
 
         events = []
         for parsed in parsed_lines:
+            if _lacks_action_identity(parsed):
+                continue
             stable = self._add_observation(parsed, sampled_frame)
             if stable is None:
+                continue
+            if _lacks_action_identity(stable):
                 continue
             actor_name = stable.actor.nickname if stable.actor else None
             target_name = stable.target.nickname if stable.target else None
@@ -109,6 +115,8 @@ class TeamFeedDetector:
                         "actor_clan_tag": stable.actor.clan_tag if stable.actor else None,
                         "target_clan_tag": stable.target.clan_tag if stable.target else None,
                         "relation": stable.relation,
+                        "action_kind": stable.evidence.get("action_kind"),
+                        "actor_color_hex": stable.evidence.get("actor_color_hex"),
                         "raw_text": stable.raw_text,
                         "crop": stable.evidence.get("row_crop") or crop_path,
                         "evidence": stable.evidence,
@@ -159,10 +167,23 @@ class TeamFeedDetector:
                 )
 
             row_key = f"team_feed:row:{index}"
-            full = self._ocr.read_text(row.image, mode="feed_line", cache_key=f"{row_key}:full").normalized
-            left_img, right_img = _split_row_image(row)
-            left_text = self._read_feed_name(left_img, f"{row_key}:left") if left_img.size else ""
-            right_text = self._read_feed_name(right_img, f"{row_key}:right") if right_img.size else ""
+            row_image = self._temporal_row_image(row)
+            full = ""
+            left_img, icon_img, right_img = _split_row_image(row)
+            can_read_enemy = row.red_bbox is not None or _has_red_text(right_img)
+            enemy_img = _red_text_crop(right_img) if right_img.size and can_read_enemy else np.empty((0, 0, 3), dtype=np.uint8)
+            left_crop_path = icon_crop_path = enemy_crop_path = None
+            if self._config.ocr.save_crops:
+                if left_img.size:
+                    left_crop_path = self._output.save_debug_crop(left_img, "team_feed", f"team_feed_row_{index}_actor", sampled_frame)
+                if icon_img.size:
+                    icon_crop_path = self._output.save_debug_crop(icon_img, "team_feed", f"team_feed_row_{index}_icons", sampled_frame)
+                if enemy_img.size:
+                    enemy_crop_path = self._output.save_debug_crop(enemy_img, "team_feed", f"team_feed_row_{index}_enemy_red", sampled_frame)
+            right_text = self._read_feed_name(enemy_img, f"{row_key}:right", mode="feed_enemy_name") if enemy_img.size else ""
+            left_text = self._read_feed_name(left_img, f"{row_key}:left", mode="feed_name") if left_img.size and right_text else ""
+            enemy_candidates = _name_candidates([_parse_feed_name(line) for line in right_text.splitlines()])
+            white_icon_count = _count_white_icon_components(row.image, row.red_bbox)
             parsed_line = parse_visual_feed_line(
                 full_text=full,
                 left_text=left_text,
@@ -170,26 +191,46 @@ class TeamFeedDetector:
                 team_members=team_members,
                 team_profiles=team_profiles,
                 actor_color_hex=_dominant_hex_color(left_img),
-                visual_event_type=_visual_event_type(row.image),
+                visual_event_type=_visual_event_type(row.image, row.red_bbox),
+                white_icon_count=white_icon_count,
                 row_confidence=row.confidence,
                 row_y=row.y1,
                 row_crop_path=row_crop_path,
+                left_crop_path=left_crop_path,
+                icon_crop_path=icon_crop_path,
+                enemy_crop_path=enemy_crop_path,
+                red_bbox=row.red_bbox,
+                enemy_name_candidates=enemy_candidates,
             )
             if parsed_line is not None:
                 parsed.append(parsed_line)
         return parsed
 
-    def _read_feed_name(self, image: np.ndarray, cache_key: str) -> str:
-        return _join_ocr_texts(
-            self._ocr.read_text(image, mode="feed_name", cache_key=f"{cache_key}:name").normalized,
-            self._ocr.read_text(image, mode="feed_raw", cache_key=f"{cache_key}:raw").normalized,
+    def _read_feed_name(self, image: np.ndarray, cache_key: str, mode: str) -> str:
+        return self._ocr.read_text(image, mode=mode, cache_key=f"{cache_key}:name").normalized
+
+    def _temporal_row_image(self, row: FeedRow) -> np.ndarray:
+        row_bucket = row.y1 // 24
+        buffer = self._row_buffers.setdefault(
+            row_bucket,
+            deque(maxlen=max(self._config.team_feed.temporal_buffer_frames, 1)),
         )
+        buffer.append(row.image.copy())
+        if len(buffer) < 3:
+            return row.image
+        shapes = {image.shape for image in buffer}
+        if len(shapes) != 1:
+            return row.image
+        stack = np.stack(list(buffer), axis=0)
+        median = np.median(stack, axis=0).astype(np.uint8)
+        maximum = np.max(stack, axis=0).astype(np.uint8)
+        return cv2.addWeighted(median, 0.7, maximum, 0.3, 0)
 
     def _should_run(self, timestamp_ms: int) -> bool:
         if self._last_ocr_ms is None:
             self._last_ocr_ms = timestamp_ms
             return True
-        interval_ms = 250
+        interval_ms = max(self._config.team_feed.interval_ms, 1)
         if timestamp_ms - self._last_ocr_ms >= interval_ms:
             self._last_ocr_ms = timestamp_ms
             return True
@@ -204,18 +245,29 @@ def parse_visual_feed_line(
     team_profiles: list[dict[str, object]] | None,
     actor_color_hex: str | None,
     visual_event_type: EventType | None,
+    white_icon_count: int,
     row_confidence: float,
     row_y: int | None,
     row_crop_path: str | None,
+    left_crop_path: str | None = None,
+    icon_crop_path: str | None = None,
+    enemy_crop_path: str | None = None,
+    red_bbox: tuple[int, int, int, int] | None = None,
+    enemy_name_candidates: list[str] | None = None,
 ) -> ParsedFeedLine | None:
     full = normalize_ocr_lines(full_text)
     left = normalize_ocr_lines(left_text)
     right = normalize_ocr_lines(right_text)
     actor_from_color = _find_team_member_by_color(actor_color_hex, team_profiles or [])
-    actor = _parse_feed_name(left) or _find_team_member_name(full, team_members) or actor_from_color
+    actor_from_left = _parse_feed_name(left)
+    if actor_from_left is not None and " " in actor_from_left.nickname and not _name_in_team(actor_from_left.nickname, team_members):
+        actor_from_left = None
+    actor = actor_from_left or _find_team_member_name(full, team_members) or actor_from_color
     if actor_from_color is not None and (actor is None or not _name_in_team(actor.nickname, team_members)):
         actor = actor_from_color
     target = _parse_feed_name(right)
+    if target is None and enemy_name_candidates:
+        target = FeedName(display=enemy_name_candidates[0], nickname=enemy_name_candidates[0], clan_tag=None, confidence=0.45)
 
     if actor is None and target is None and visual_event_type is None:
         return None
@@ -225,13 +277,18 @@ def parse_visual_feed_line(
         return None
 
     explicit_event_type = _event_type_from_line(full)
-    if target is None and explicit_event_type is None and visual_event_type is None:
+    icon_event_type = _event_type_from_icon_count(white_icon_count)
+    action_kind = _action_kind_from_line(full)
+    if target is None and explicit_event_type is None and visual_event_type is None and icon_event_type is None:
         event_type = EventType.TEAM_FEED_EVENT
     else:
-        event_type = explicit_event_type or visual_event_type or EventType.KILL
+        event_type = explicit_event_type or visual_event_type or icon_event_type or EventType.KILL
+    if event_type == EventType.TEAM_FEED_EVENT and action_kind is None:
+        action_kind = "unknown_ping"
     relation = _relation_for(actor.nickname if actor else None, target.nickname if target else None, team_members)
     confidence = min(max(row_confidence, 0.35) + (0.15 if target else 0.0), 0.82)
     raw_text = " | ".join(part for part in [left, right, full] if part)
+    team_member_profile_candidate = actor_from_color.nickname if actor_from_color else None
     return ParsedFeedLine(
         event_type=event_type,
         actor=actor,
@@ -246,8 +303,18 @@ def parse_visual_feed_line(
             "full_text": full,
             "actor_color_hex": actor_color_hex,
             "visual_event_type": visual_event_type.value if visual_event_type else None,
+            "white_icon_count": white_icon_count,
+            "action_kind": action_kind,
             "row_y": row_y,
             "row_crop": row_crop_path,
+            "left_crop": left_crop_path,
+            "icon_crop": icon_crop_path,
+            "enemy_red_crop": enemy_crop_path,
+            "red_bbox": red_bbox,
+            "enemy_name_color": "red" if target else None,
+            "enemy_name_candidates": enemy_name_candidates or [],
+            "team_member_profile_candidate": team_member_profile_candidate,
+            "needs_review": target is None or (actor is None and actor_color_hex is not None) or (event_type == EventType.TEAM_FEED_EVENT and action_kind == "unknown_ping"),
         },
     )
 
@@ -259,6 +326,12 @@ def _join_ocr_texts(*texts: str) -> str:
             if line and line not in lines:
                 lines.append(line)
     return "\n".join(lines)
+
+
+def _lacks_action_identity(parsed: ParsedFeedLine) -> bool:
+    if parsed.event_type not in {EventType.KILL, EventType.KNOCK, EventType.DEATH}:
+        return False
+    return parsed.actor is None and parsed.target is None and not normalize_ocr_lines(parsed.raw_text)
 
 
 def parse_team_feed_text(text: str, team_members: list[str]) -> list[ParsedFeedLine]:
@@ -418,7 +491,16 @@ def _extract_action_rows(crop: np.ndarray, search_width: int) -> list[FeedRow]:
         row_image = crop[max(y1 - 4, 0) : min(y2 + 5, crop.shape[0]), x1:x2]
         split_x = _detect_weapon_split(row_image)
         confidence = min(0.42 + (row_red + row_green) / max(width * height * 2.5, 1), 0.82)
-        rows.append(FeedRow(image=row_image, y1=y1, y2=y2, split_x=split_x, confidence=confidence))
+        rows.append(
+            FeedRow(
+                image=row_image,
+                y1=y1,
+                y2=y2,
+                split_x=split_x,
+                confidence=confidence,
+                red_bbox=_red_bbox(row_image),
+            )
+        )
     return sorted(rows, key=lambda row: row.y1)[:6]
 
 
@@ -517,8 +599,94 @@ def _red_text_mask(image: np.ndarray) -> np.ndarray:
     hue = hsv[:, :, 0]
     saturation = hsv[:, :, 1]
     value = hsv[:, :, 2]
-    red = ((hue < 12) | (hue > 168)) & (saturation > 55) & (value > 70)
+    red = ((hue < 35) | (hue > 168)) & (saturation > 30) & (value > 45)
     return red.astype(np.uint8) * 255
+
+
+def _red_bbox(image: np.ndarray) -> tuple[int, int, int, int] | None:
+    if image.size == 0:
+        return None
+    components = _feed_components(_red_text_mask(image))
+    if not components:
+        return None
+    x1 = min(x for x, _, _, _ in components)
+    y1 = min(y for _, y, _, _ in components)
+    x2 = max(x + width for x, _, width, _ in components)
+    y2 = max(y + height for _, y, _, height in components)
+    if x2 - x1 < 8 or y2 - y1 < 3:
+        return None
+    return x1, y1, x2, y2
+
+
+def _red_text_crop(image: np.ndarray) -> np.ndarray:
+    if image.size == 0:
+        return image
+    bbox = _red_bbox(image)
+    if bbox is None:
+        return image
+    x1, y1, x2, y2 = bbox
+    return image[max(y1 - 4, 0) : min(y2 + 5, image.shape[0]), max(x1 - 4, 0) : min(x2 + 5, image.shape[1])]
+
+
+def _has_red_text(image: np.ndarray) -> bool:
+    if image.size == 0:
+        return False
+    mask = _red_text_mask(image)
+    return int((mask > 0).sum()) >= max(12, int(image.shape[0] * image.shape[1] * 0.01))
+
+
+def _count_white_icon_components(row: np.ndarray, red_bbox: tuple[int, int, int, int] | None = None) -> int:
+    if row.size == 0:
+        return 0
+    hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)
+    white = ((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 155)).astype(np.uint8) * 255
+    if red_bbox is not None:
+        red_x1, _, _, _ = red_bbox
+        left_bound = int(row.shape[1] * 0.18)
+        right_bound = max(red_x1 - 3, left_bound + 1)
+    else:
+        left_bound = int(row.shape[1] * 0.18)
+        right_bound = int(row.shape[1] * 0.78)
+    icon_mask = np.zeros_like(white)
+    icon_mask[:, left_bound:right_bound] = white[:, left_bound:right_bound]
+    icon_mask = cv2.morphologyEx(
+        icon_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 2)),
+        iterations=1,
+    )
+    contours, _ = cv2.findContours(icon_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    components = []
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        if area < 5 or width < 3 or height < 3:
+            continue
+        if width > row.shape[1] * 0.22 or height > row.shape[0] * 0.85:
+            continue
+        components.append((x, y, width, height))
+    return len(_merge_close_icon_components(components))
+
+
+def _merge_close_icon_components(components: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if not components:
+        return []
+    ordered = sorted(components, key=lambda item: item[0])
+    merged = [ordered[0]]
+    for component in ordered[1:]:
+        x, y, width, height = component
+        previous_x, previous_y, previous_width, previous_height = merged[-1]
+        previous_x2 = previous_x + previous_width
+        overlaps_y = y <= previous_y + previous_height + 3 and previous_y <= y + height + 3
+        if x - previous_x2 <= 4 and overlaps_y:
+            x1 = min(previous_x, x)
+            y1 = min(previous_y, y)
+            x2 = max(previous_x + previous_width, x + width)
+            y2 = max(previous_y + previous_height, y + height)
+            merged[-1] = (x1, y1, x2 - x1, y2 - y1)
+        else:
+            merged.append(component)
+    return merged
 
 
 def _detect_weapon_split(row: np.ndarray) -> int | None:
@@ -539,7 +707,7 @@ def _detect_weapon_split(row: np.ndarray) -> int | None:
     return split if 0 < split < width else None
 
 
-def _visual_event_type(row: np.ndarray) -> EventType | None:
+def _visual_event_type(row: np.ndarray, red_bbox: tuple[int, int, int, int] | None = None) -> EventType | None:
     if row.size == 0:
         return None
     hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)
@@ -548,37 +716,36 @@ def _visual_event_type(row: np.ndarray) -> EventType | None:
     value = hsv[:, :, 2]
     red_pixels = int(((((hue < 12) | (hue > 168)) & (saturation > 70) & (value > 90))).sum())
     green_pixels = int((((hue > 35) & (hue < 100) & (saturation > 55) & (value > 80))).sum())
-    white = ((saturation < 75) & (value > 165)).astype(np.uint8)
     if red_pixels + green_pixels < 20:
         return None
-    columns = np.where(white.sum(axis=0) > 0)[0]
-    if len(columns) == 0:
-        return None
-    white_width = int(columns[-1] - columns[0] + 1)
-    white_pixels = int(white.sum())
-    if white_width >= 24 and white_pixels >= 18:
+    white_icon_count = _count_white_icon_components(row, red_bbox)
+    if white_icon_count >= 2:
+        return EventType.KNOCK
+    if white_icon_count == 1:
         return EventType.KILL
-    if white_width >= 8 and white_pixels >= 8:
+    if white_icon_count > 0:
         return EventType.TEAM_FEED_EVENT
     return None
 
 
-def _split_row_image(row: FeedRow) -> tuple[np.ndarray, np.ndarray]:
+def _split_row_image(row: FeedRow) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     image = row.image
     if image.size == 0:
-        return image, image
+        return image, image, image
     if row.red_bbox is not None:
         red_x1, red_y1, red_x2, red_y2 = row.red_bbox
         y1 = max(red_y1 - 6, 0)
         y2 = min(red_y2 + 7, image.shape[0])
         left = image[y1:y2, : max(red_x1 - 8, 1)]
         right = image[y1:y2, max(red_x1 - 5, 0) : min(red_x2 + 8, image.shape[1])]
-        return _trim_empty_columns(left), _trim_empty_columns(right)
+        icon = image[:, max(int(image.shape[1] * 0.18), 0) : max(red_x1 - 4, 1)]
+        return _trim_empty_columns(left), _trim_empty_columns(icon), _trim_empty_columns(right)
     split_x = row.split_x or int(image.shape[1] * 0.50)
     gap = max(10, int(image.shape[1] * 0.045))
     left = image[:, : max(split_x - gap, 1)]
     right = image[:, min(split_x + gap, image.shape[1] - 1) :]
-    return _trim_empty_columns(left), _trim_empty_columns(right)
+    icon = image[:, max(split_x - gap, 0) : min(split_x + gap, image.shape[1])]
+    return _trim_empty_columns(left), _trim_empty_columns(icon), _trim_empty_columns(right)
 
 
 def _trim_empty_columns(image: np.ndarray) -> np.ndarray:
@@ -603,6 +770,25 @@ def _event_type_from_line(line: str) -> EventType | None:
         return EventType.DEATH
     if any(token in lowered for token in ["отмет", "метк", "ping", "mark"]):
         return EventType.TEAM_FEED_EVENT
+    return None
+
+
+def _event_type_from_icon_count(white_icon_count: int) -> EventType | None:
+    if white_icon_count >= 2:
+        return EventType.KNOCK
+    if white_icon_count == 1:
+        return EventType.KILL
+    return None
+
+
+def _action_kind_from_line(line: str) -> str | None:
+    lowered = line.lower()
+    if any(token in lowered for token in ["enemy ping", "enemy mark", "враг", "противник"]):
+        return "ping_enemy"
+    if any(token in lowered for token in ["danger", "опас", "уведом", "предуп"]):
+        return "ping_notice"
+    if any(token in lowered for token in ["ping", "mark", "отмет", "метк"]):
+        return "ping_simple"
     return None
 
 
@@ -673,6 +859,7 @@ def _best_name_fragment(text: str) -> str | None:
     cleaned = re.sub(r"[^\w\s\u3040-\u30ff\u3400-\u9fff\u0400-\u04ff-]", " ", text, flags=re.UNICODE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" _-")
     candidates = [part.strip(" _-") for part in re.split(r"\s{2,}|[|:;]", cleaned) if part.strip(" _-")]
+    candidates.extend(part.strip(" _-") for part in cleaned.split() if part.strip(" _-"))
     candidates.append(cleaned)
     valid = [candidate for candidate in candidates if _looks_like_nickname(candidate)]
     if not valid:

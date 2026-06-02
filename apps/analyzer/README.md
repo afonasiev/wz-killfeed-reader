@@ -61,4 +61,4 @@ Edit `config/default.yml`:
 - `ocr.cache_mse_threshold` controls how much a cropped text region may change before OCR is scheduled again.
 - `ocr.worker_threads` and `ocr.max_pending_tasks` bound OCR CPU use and queue growth for stream processing.
 
-For long recordings, use `--start-at` and `--duration` while tuning. The analyzer writes both low-level `events.jsonl` and aggregated `fights.json`, because one source video can contain many separate fights.
+For long recordings, use `--start-at` and `--duration` while tuning. The analyzer writes both low-level `events.jsonl` and aggregated `fights.json`, because one source video can contain many separate fights. Each fight includes `fight_uid`, built as `warzone_match_id:fight_id`, plus an `actions` list for team feed events such as kills, knocks, deaths, and pings/marks. `summary.json` also includes aggregate action counts by type and by team member.

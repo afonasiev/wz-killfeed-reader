@@ -15,31 +15,31 @@ class MatchStateDetector:
         lobby_party_bright = self._bright_ratio(frame, "lobby_party", 155)
         squad_hud_bright = self._bright_ratio(frame, "squad_hud", 155)
         match_id_bright = self._bright_ratio(frame, "match_id", 155)
-        gameplay_markers_bright = self._bright_ratio(frame, "gameplay_markers", 155)
-        gameplay_markers_hot = self._bright_ratio(frame, "gameplay_markers", 210)
+        center_combat_bright = self._bright_ratio(frame, "center_combat", 155)
+        center_combat_hot = self._bright_ratio(frame, "center_combat", 210)
 
         has_lobby_party = lobby_party_bright >= 0.02
         has_squad_hud = squad_hud_bright >= 0.025
         has_bright_menu_bottom = match_id_bright >= 0.18
-        has_gameplay_markers = gameplay_markers_bright >= 0.02
+        has_gameplay_activity = center_combat_bright >= 0.06 or center_combat_hot >= 0.015
 
         evidence = {
             "lobby_party_bright": lobby_party_bright,
             "squad_hud_bright": squad_hud_bright,
             "match_id_bright": match_id_bright,
-            "gameplay_markers_bright": gameplay_markers_bright,
-            "gameplay_markers_hot": gameplay_markers_hot,
+            "center_combat_bright": center_combat_bright,
+            "center_combat_hot": center_combat_hot,
         }
 
         if has_lobby_party and has_bright_menu_bottom:
             return MatchState.LOBBY, evidence
         if has_bright_menu_bottom:
             return MatchState.LOADING, evidence
-        if has_squad_hud and has_gameplay_markers:
+        if has_squad_hud and has_gameplay_activity:
             return MatchState.GAMEPLAY, evidence
-        if gameplay_markers_hot >= 0.025 and not has_lobby_party:
+        if has_gameplay_activity and not has_lobby_party:
             return MatchState.SPECTATING_OR_DEAD, evidence
-        if has_gameplay_markers and not has_squad_hud:
+        if center_combat_bright >= 0.03 and not has_squad_hud:
             return MatchState.CINEMATIC, evidence
         return MatchState.UNKNOWN, evidence
 

@@ -53,6 +53,7 @@ class FightDetectionConfig:
     min_duration_seconds: float = 8.0
     review_after_seconds: float = 240.0
     ignore_initial_seconds: float = 90.0
+    action_attach_tolerance_ms: int = 3000
 
 
 @dataclass
@@ -71,6 +72,12 @@ class OcrConfig:
 
 
 @dataclass
+class TeamFeedConfig:
+    interval_ms: int = 500
+    temporal_buffer_frames: int = 20
+
+
+@dataclass
 class DebugConfig:
     save_transition_frames: bool = True
     save_every_n_sampled_frames: int = 0
@@ -81,6 +88,7 @@ class AnalyzerConfig:
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     fight_detection: FightDetectionConfig = field(default_factory=FightDetectionConfig)
     ocr: OcrConfig = field(default_factory=OcrConfig)
+    team_feed: TeamFeedConfig = field(default_factory=TeamFeedConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     regions: dict[str, Region] = field(default_factory=dict)
 
@@ -118,9 +126,12 @@ class FightSegment:
     duration_ms: Optional[int] = None
     start_debug_frame: Optional[str] = None
     end_debug_frame: Optional[str] = None
+    actions: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["fight_uid"] = fight_uid(self.warzone_match_id, self.fight_id)
+        return payload
 
 
 @dataclass
@@ -137,6 +148,9 @@ class AnalyzerSummary:
     team_colors: list[dict[str, object]] = field(default_factory=list)
     team_history: list[dict[str, object]] = field(default_factory=list)
     state_counts: dict[str, int] = field(default_factory=dict)
+    actions: int = 0
+    action_counts: dict[str, int] = field(default_factory=dict)
+    team_action_summary: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -145,3 +159,8 @@ class AnalyzerSummary:
 
     def to_json(self, indent: int | None = None) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+
+def fight_uid(warzone_match_id: str | None, fight_id: int) -> str:
+    match_part = warzone_match_id or "unknown_match"
+    return f"{match_part}:{fight_id}"
